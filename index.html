@@ -16,14 +16,15 @@ input[type=file]{max-width:100%;color:var(--muted);margin-top:10px}label{display
 </style>
 </head>
 <body><main>
-<header class="top"><div class="logo">👓</div><div><h1>AI Glasses 2.0</h1><p>Phone-powered assistive web app · ESP32-C3 + Hotspot WebSocket</p></div></header>
+<header class="top"><div class="logo">👓</div><div><h1>AI Glasses 2.0</h1><p>Phone-powered assistive web app · ESP32-C3 HTTP Polling</p></div></header>
 <div class="pill"><span class="dot" id="dot"></span><span id="connection">ESP32 not connected</span></div>
 <section class="grid">
- <article class="card"><div class="label">Distance</div><div class="value" id="distance">—</div><div class="sub" id="distanceSub">Connect the glasses hotspot</div></article>
+ <article class="card"><div class="label">Distance</div><div class="value" id="distance">—</div><div class="sub" id="distanceSub">Connect the glasses IP</div></article>
  <article class="card"><div class="label">Touch input</div><div class="value" id="touch">—</div><div class="sub" id="touchSub">Tap / double-tap / hold commands</div></article>
 </section>
-<section class="card wide"><h2>1 · Connect glasses</h2><p class="small">Turn on your phone's personal hotspot and ensure your ESP32 is flashed with your hotspot credentials. Then click connect below.</p>
- <div class="actions"><button id="wsBtn">Connect ESP32 Hotspot</button><button id="wsOff" class="secondary">Disconnect</button></div><div id="sensorStatus" class="statusline">Not connected.</div>
+<section class="card wide"><h2>1 · Connect glasses</h2><p class="small">Fixed ESP32 Hotspot IP address configured below.</p>
+ <div class="field"><input id="espIp" type="text" value="10.64.44.150"></div>
+ <div class="actions"><button id="connectBtn">Start polling ESP32</button><button id="disconnectBtn" class="secondary">Stop polling</button></div><div id="sensorStatus" class="statusline">Not connected.</div>
 </section>
 <section class="card wide"><h2>2 · AI settings</h2><label for="key">Gemini API key (kept in this page's memory only)</label><input id="key" type="password" autocomplete="off" placeholder="Paste your NEW Gemini API key" style="width:100%;margin-top:6px;background:#0b1321;color:var(--text);border:1px solid var(--line);border-radius:11px;padding:12px;font:inherit">
  <div class="field"><select id="language" aria-label="Response language"><option value="English">English</option><option value="Hindi">Hindi</option><option value="Punjabi">Punjabi</option><option value="French">French</option><option value="Spanish">Spanish</option><option value="German">German</option><option value="Japanese">Japanese</option><option value="Chinese">Chinese</option><option value="Italian">Italian</option><option value="Portuguese">Portuguese</option><option value="Russian">Russian</option><option value="Arabic">Arabic</option></select><button id="forgetKey" class="secondary">Clear key</button></div>
@@ -52,7 +53,7 @@ input[type=file]{max-width:100%;color:var(--muted);margin-top:10px}label{display
 <script>
 (() => {
  const $ = id => document.getElementById(id);
- let ws=null, stream=null, captured=null, lastWarn=0;
+ let pollInterval=null, stream=null, captured=null, lastWarn=0;
  let touchStart=0, touchWas=false, lastTap=0, longFired=false, recognition=null, lastAnswer='', lastOCR='';
  const setStatus=(ok,msg)=>{$('dot').style.background=ok?'var(--green)':'var(--red)';$('connection').textContent=msg;};
  const speak=(text)=>{if(!text)return; speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(text);u.lang=voiceLang($('language').value);speechSynthesis.speak(u);};
@@ -71,34 +72,52 @@ input[type=file]{max-width:100%;color:var(--muted);margin-top:10px}label{display
  function capture(){const v=$('video'),c=$('canvas');if(!v.videoWidth){$('answer').textContent='Start the camera and wait for the preview.';return;}c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0,c.width,c.height);captured=c.toDataURL('image/jpeg',.82);$('preview').src=captured;$('preview').hidden=false;$('describeBtn').disabled=false;$('answer').textContent='Frame captured. Choose Describe scene or ask a question.';}
  function stopCamera(){if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;$('video').srcObject=null;$('video').hidden=true;$('captureBtn').disabled=true;$('stopBtn').disabled=true;}
 
- function connectWebSocket(){
-   try{
-     // Connected via mDNS hostname to match the phone hotspot network
-     ws=new WebSocket('ws://ai-glasses.local:81');
-     ws.onopen=()=>{setStatus(true,'ESP32 Hotspot connected');$('sensorStatus').textContent='Connected to AI Glasses via Hotspot. Receiving packets.';};
-     ws.onmessage=ev=>{
-       const packet=ev.data;
-       const m=packet.match(/mm=(-?\d+)/),t=packet.match(/touch=(\d)/);
-       if(m){
-         const mm=Number(m[1]);
-         if(mm<0){$('distance').textContent='No reading';$('distanceSub').textContent='Check VL53L0X range/status';}
-         else{
-           $('distance').textContent=mm+' mm';
-           $('distanceSub').textContent=mm<500?'Obstacle nearby — take care':(mm/10).toFixed(1)+' cm';
-           $('distance').className='value '+(mm<500?'danger':mm<800?'warn':'good');
-           if(mm<500&&Date.now()-lastWarn>3000){lastWarn=Date.now();if(navigator.vibrate)navigator.vibrate(180);speak('Obstacle nearby');}
+ function startPolling(){
+   const ip = $('espIp').value.trim();
+   if(!ip){ alert('Please enter ESP32 IP address.'); return; }
+   if(pollInterval) clearInterval(pollInterval);
+
+   pollInterval = setInterval(async () => {
+     try {
+       const res = await fetch('http://' + ip + '/sensor', {signal: AbortSignal.timeout(1500)});
+       if(!res.ok) throw new Error('HTTP error');
+       const data = await res.json();
+       
+       setStatus(true, 'ESP32 Connected via HTTP');
+       $('sensorStatus').textContent='Receiving sensor data successfully.';
+
+       const mm = data.mm;
+       if(mm < 0){
+         $('distance').textContent='No reading';
+         $('distanceSub').textContent='Check VL53L0X range/status';
+       } else {
+         $('distance').textContent=mm+' mm';
+         $('distanceSub').textContent=mm<500?'Obstacle nearby — take care':(mm/10).toFixed(1)+' cm';
+         $('distance').className='value '+(mm<500?'danger':mm<800?'warn':'good');
+         if(mm<500 && Date.now()-lastWarn>3000){
+           lastWarn=Date.now();
+           if(navigator.vibrate) navigator.vibrate(180);
+           speak('Obstacle nearby');
          }
        }
-       if(t){
-         const touched=t[1]==='1';
-         $('touch').textContent=touched?'TOUCHED':'Not touched';
-         $('touch').className='value '+(touched?'good':'');
-         handleTouch(touched);
-       }
-     };
-     ws.onclose=()=>{setStatus(false,'ESP32 disconnected');$('sensorStatus').textContent='Hotspot connection closed.';};
-     ws.onerror=err=>{$('sensorStatus').textContent='WebSocket error. Ensure hotspot is active and ESP32 is powered on.';setStatus(false,'ESP32 not connected');};
-   }catch(e){$('sensorStatus').textContent='Connection error: '+e.message;setStatus(false,'ESP32 not connected');}
+
+       const touched = data.touch === 1;
+       $('touch').textContent = touched ? 'TOUCHED' : 'Not touched';
+       $('touch').className = 'value ' + (touched ? 'good' : '');
+       handleTouch(touched);
+
+     } catch(err) {
+       setStatus(false, 'ESP32 disconnected');
+       $('sensorStatus').textContent='Polling error. Check hotspot and ESP32 power.';
+     }
+   }, 250);
+ }
+
+ function stopPolling(){
+   if(pollInterval) clearInterval(pollInterval);
+   pollInterval=null;
+   setStatus(false, 'ESP32 disconnected');
+   $('sensorStatus').textContent='Polling stopped.';
  }
 
  function handleTouch(touched){const now=Date.now();if(touched&&!touchWas){touchStart=now;longFired=false;}if(touched&&touchWas&&!longFired&&now-touchStart>=900){longFired=true;$('touchSub').textContent='Long press: voice question';startVoiceQuestion();}if(!touched&&touchWas){const dur=now-touchStart;if(!longFired&&dur>=40){if(now-lastTap<450){lastTap=0;$('touchSub').textContent='Double tap: ask about scene';askAI($('question').value.trim()||'What is directly in front of me? Describe relevant objects, people, doors, stairs, vehicles and visible text.');}else{lastTap=now;$('touchSub').textContent='Tap detected; waiting briefly for double tap';setTimeout(()=>{if(lastTap===now){$('touchSub').textContent='Single tap: describe scene';if(captured)askAI('Describe the scene for a visually impaired person. Mention nearby obstacles, people, doors, stairs, vehicles and visible text. Keep it under 35 words.');else startCamera().then(()=>{});}},470);}}}touchWas=touched;}
@@ -112,13 +131,13 @@ input[type=file]{max-width:100%;color:var(--muted);margin-top:10px}label{display
  async function enrollFace(){const name=$('faceName').value.trim(),file=$('faceFile').files[0];if(!name||!file){$('faceStatus').textContent='Enter a name and choose a reference photo.';return;}try{$('faceStatus').textContent='Loading face model and processing photo…';await loadFaceApi();const img=new Image();img.src=URL.createObjectURL(file);await img.decode();const desc=await descriptorFromImage(img);const faces=getFaces().filter(f=>f.name!==name);faces.push({name,descriptor:desc});localStorage.setItem('ai_glasses_faces',JSON.stringify(faces));$('faceStatus').textContent='Enrolled '+name+' on this browser ('+faces.length+' saved).';}catch(e){$('faceStatus').textContent='Face enrollment error: '+e.message;}}
  async function recognizeFace(){if(!captured){$('faceStatus').textContent='Start camera and capture a frame first.';return;}const faces=getFaces();if(!faces.length){$('faceStatus').textContent='Enroll a reference photo first.';return;}try{$('faceStatus').textContent='Checking captured frame locally…';await loadFaceApi();const img=new Image();img.src=captured;await img.decode();const desc=await descriptorFromImage(img);let best={name:'Unknown person',distance:Infinity};for(const f of faces){const d=faceapi.euclideanDistance(new Float32Array(desc),new Float32Array(f.descriptor));if(d<best.distance)best={name:f.name,distance:d};}const matched=best.distance<0.52;$('faceStatus').textContent=matched?'Possible match: '+best.name+' (similarity check '+best.distance.toFixed(2)+').':'No enrolled face matched confidently.';if(matched)speak('Possible match: '+best.name);else speak('I cannot confidently identify this person.');}catch(e){$('faceStatus').textContent='Face recognition error: '+e.message;}}
 
- $('wsBtn').addEventListener('click',connectWebSocket);
- $('wsOff').addEventListener('click',()=>{if(ws)ws.close();ws=null;setStatus(false,'ESP32 disconnected');$('sensorStatus').textContent='Disconnected.';});
+ $('connectBtn').addEventListener('click',startPolling);
+ $('disconnectBtn').addEventListener('click',stopPolling);
  $('cameraBtn').addEventListener('click',startCamera);$('captureBtn').addEventListener('click',capture);$('stopBtn').addEventListener('click',stopCamera);
  $('describeBtn').addEventListener('click',()=>askAI('Describe the scene for a visually impaired person. Prioritise nearby obstacles, people, doors, stairs, vehicles, and readable text. Keep it under 35 words.'));$('askBtn').addEventListener('click',()=>askAI($('question').value.trim()||'Describe the scene and important nearby objects.'));$('voiceAskBtn').addEventListener('click',startVoiceQuestion);$('speakBtn').addEventListener('click',()=>speak(lastAnswer));$('stopSpeechBtn').addEventListener('click',()=>speechSynthesis.cancel());$('forgetKey').addEventListener('click',()=>{$('key').value='';});
  $('readDocBtn').addEventListener('click',readDocument);$('speakDocBtn').addEventListener('click',()=>speak(lastOCR.slice(0,5000)));$('enrollFaceBtn').addEventListener('click',enrollFace);$('recognizeBtn').addEventListener('click',recognizeFace);$('clearFacesBtn').addEventListener('click',()=>{localStorage.removeItem('ai_glasses_faces');$('faceStatus').textContent='Enrolled faces cleared from this browser.';});
  $('startListenBtn').addEventListener('click',()=>{const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){$('transcript').value='Speech recognition unavailable in this browser.';return;}if(recognition)recognition.stop();recognition=new SR();recognition.lang=voiceLang($('language').value);recognition.continuous=true;recognition.interimResults=true;recognition.onresult=e=>{let s='';for(let i=0;i<e.results.length;i++)s+=e.results[i][0].transcript+(e.results[i].isFinal?'\n':'');$('transcript').value=s;};recognition.onerror=e=>$('transcript').value+='\nVoice error: '+e.error;recognition.start();});$('stopListenBtn').addEventListener('click',()=>{if(recognition)recognition.stop();});$('sayTextBtn').addEventListener('click',()=>speak($('typedSpeech').value));
- $('docFile').addEventListener('change',()=>{$('ocrStatus').textContent=$('docFile').files[0]?.name||'No document selected.';});
+ $('docFile').addEventListener('change',()=>{$('ocrStatus').textContent=$('docFile'].files[0]?.name||'No document selected.';});
  $('faceStatus').textContent=getFaces().length?getFaces().length+' known face(s) saved in this browser.':'No face enrolled in this browser.';
 })();
 </script></body></html>
